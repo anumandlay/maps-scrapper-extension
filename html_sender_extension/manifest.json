@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Send Page HTML",
+  "version": "1.0",
+  "description": "Send current page HTML to local API",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1:5000/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}
