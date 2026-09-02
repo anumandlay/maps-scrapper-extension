@@ -352,6 +352,130 @@ def update_status(sno: int, status: str):
 # MAPS DATA API
 # ─────────────────────────────────────────────────────────────
 
+MAPS_PLACE_EXTRACT_JS = """
+(() => {
+    const text = (el) => (el && (el.textContent || '').trim()) || '';
+    const pickText = (...selectors) => {
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            const t = text(el);
+            if (t) return t;
+        }
+        return '';
+    };
+    const pickHref = (...selectors) => {
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.href) return el.href;
+        }
+        return '';
+    };
+
+    let name = pickText('h1.DUwDvf', 'h1.fontHeadlineLarge');
+    if (!name) {
+        const h1 = document.querySelector('h1');
+        name = text(h1);
+    }
+
+    const addrEl = document.querySelector('[data-item-id="address"]');
+    const address = text(addrEl).replace(/\\s+/g, ' ');
+
+    let phone = '';
+    const phoneEl = document.querySelector('[data-item-id^="phone:"]');
+    if (phoneEl) {
+        phone = text(phoneEl);
+        if (!phone) {
+            const id = phoneEl.getAttribute('data-item-id') || '';
+            phone = id.replace(/^phone:tel:/, '').replace(/^phone:/, '');
+        }
+    }
+    if (!phone) {
+        const btn = [...document.querySelectorAll('button[aria-label]')].find((b) => {
+            const label = b.getAttribute('aria-label') || '';
+            return label.startsWith('Phone:') || label.startsWith('Call');
+        });
+        if (btn) {
+            phone = (btn.getAttribute('aria-label') || '').split(':').slice(1).join(':').trim();
+        }
+    }
+
+    const website = pickHref('a[data-item-id="authority"]', 'a[aria-label*="Website"]');
+
+    let service_type = '';
+    const catBtn = document.querySelector('button.DkEaL');
+    if (catBtn) service_type = text(catBtn);
+
+    let maps_link = window.location.href || '';
+    if (!maps_link.includes('/maps/place/')) {
+        const placeA = document.querySelector('a[href*="/maps/place/"]');
+        maps_link = placeA ? placeA.href : '';
+    }
+    if (maps_link) maps_link = maps_link.split('?')[0];
+
+    let email = '';
+    const mail = document.querySelector('a[href^="mailto:"]');
+    if (mail) email = mail.href.replace('mailto:', '').split('?')[0];
+
+    return {
+        agency_name: name || null,
+        address: address || null,
+        phone: phone || null,
+        email: email || null,
+        website: website || null,
+        service_type: service_type || null,
+        google_maps_link: maps_link || null
+    };
+})();
+"""
+
+
+def post_listing_from_record(record: dict, fallback_name: str = "", fallback_link: str = "") -> bool:
+    """Dedupe and POST whatever fields we have to maps-data."""
+    global MAPS_POSTED_KEYS
+
+    if fallback_name and not record.get("agency_name"):
+        record["agency_name"] = fallback_name
+    if fallback_link and not record.get("google_maps_link"):
+        record["google_maps_link"] = normalize_maps_link(fallback_link)
+
+    if CURRENT_COUNTRY and not record.get("country"):
+        record["country"] = CURRENT_COUNTRY
+
+    payload = {k: v for k, v in record.items() if v}
+    if not payload:
+        print("[MAPS] No fields to post for listing")
+        return False
+
+    dedupe_key = payload.get("google_maps_link") or payload.get("agency_name") or ""
+    if dedupe_key and dedupe_key in MAPS_POSTED_KEYS:
+        print(f"[MAPS] Skipping duplicate: {dedupe_key[:80]}")
+        return False
+
+    if dedupe_key:
+        MAPS_POSTED_KEYS.add(dedupe_key)
+
+    posted = post_maps_record(record)
+    print(f"[MAPS] Record: {json.dumps(payload, ensure_ascii=False)}")
+    return posted
+
+
+def extract_and_post_listing(tab, list_name: str = "", place_href: str = "") -> bool:
+    """Read place details from live DOM via CDP and POST immediately."""
+    try:
+        result = tab.Runtime.evaluate(
+            expression=MAPS_PLACE_EXTRACT_JS,
+            returnByValue=True,
+        )
+        data = (result.get("result") or {}).get("value") or {}
+        if not isinstance(data, dict):
+            print("[MAPS] CDP extract returned non-dict")
+            return False
+        return post_listing_from_record(data, fallback_name=list_name, fallback_link=place_href)
+    except Exception as e:
+        print(f"[MAPS] CDP extract error: {e}")
+        return False
+
+
 def normalize_maps_link(url: str) -> str:
     if not url:
         return ""
@@ -459,11 +583,8 @@ def parse_maps_detail_html(html: str) -> dict:
         if len(parts) >= 2:
             city = parts[-2]
 
-    if not name:
-        return {}
-
-    return {
-        "agency_name":      name,
+    record = {
+        "agency_name":      name or None,
         "address":          address or None,
         "phone":            phone or None,
         "email":            email or None,
@@ -472,6 +593,7 @@ def parse_maps_detail_html(html: str) -> dict:
         "website":          website or None,
         "google_maps_link": normalize_maps_link(maps_link) or None,
     }
+    return {k: v for k, v in record.items() if v}
 
 
 def open_maps_via_search(tab) -> str:
@@ -625,9 +747,12 @@ def scrape_maps_for_keyword(keyword: str, tab, country: str = ""):
                     continue
 
                 time.sleep(random.uniform(2.5, 4))
-                print("[MAPS] Triggering extension for listing")
-                pyautogui.hotkey("ctrl", "space")
-                time.sleep(random.uniform(2, 3))
+                list_name = item.get("name") or ""
+                posted = extract_and_post_listing(tab, list_name=list_name, place_href=href)
+                if not posted:
+                    print("[MAPS] CDP post failed — trying extension fallback")
+                    pyautogui.hotkey("ctrl", "space")
+                    time.sleep(random.uniform(2, 3))
 
             scroll_result = tab.Runtime.evaluate(
                 expression="""
@@ -933,6 +1058,7 @@ def receive_html():
     if country and not record.get("country"):
         record["country"] = country
 
+    posted = post_listing_from_record(record)
     payload = {k: v for k, v in record.items() if v}
     if not payload:
         return jsonify({
@@ -942,24 +1068,6 @@ def receive_html():
             "message": "No fields parsed from HTML",
         })
 
-    dedupe_key = (
-        record.get("google_maps_link")
-        or record.get("agency_name")
-        or ""
-    )
-    if dedupe_key and dedupe_key in MAPS_POSTED_KEYS:
-        return jsonify({
-            "status":  "skipped",
-            "mode":    "maps",
-            "keyword": keyword,
-            "message": "Duplicate listing",
-        })
-
-    if dedupe_key:
-        MAPS_POSTED_KEYS.add(dedupe_key)
-
-    posted = post_maps_record(record)
-    print(f"[MAPS] Parsed: {json.dumps(payload, ensure_ascii=False)}")
     return jsonify({
         "status":  "success" if posted else "error",
         "mode":    "maps",
